@@ -9,6 +9,7 @@ setup(
       url='https://github.com/ErickRosete/DQN_Lightning',
       packages=find_packages(),
       install_requires=[
+                'torchvision',
                 'gym(==0.18.3)',
                 'wandb(==0.10.32)',
                 'pytorch-lightning(==1.3.6)']
