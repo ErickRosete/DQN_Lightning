@@ -45,6 +45,7 @@ class DQNLightning(pl.LightningModule):
         sync_rate: int = 10,
         lr: float = 1e-2,
         batch_size: int = 4,
+        tau: float = 0.05,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -57,6 +58,7 @@ class DQNLightning(pl.LightningModule):
         self.sync_rate = sync_rate
         self.lr = lr
         self.batch_size = batch_size
+        self.tau = tau
 
         self.env = gym.make(env)
         obs_size = self.env.observation_space.shape[0]
@@ -142,6 +144,27 @@ class DQNLightning(pl.LightningModule):
 
         return nn.MSELoss()(state_action_values, expected_state_action_values)
 
+    def training_epoch_end(self, _):
+        val_return = float('-inf') 
+        if self.episode_done:
+            # Log every episode end
+            wandb = self.logger.experiment
+            wandb_logs = {"train/episode_return": self.episode_return,
+                          "train/episode_length": self.episode_length,
+                          "train/episode_number": self.episode_idx}
+            if self.episode_idx % 10 == 0:
+                val_accuracy, val_return, val_length = self.evaluate()
+                wandb_logs['validation/accuracy'] = val_accuracy
+                wandb_logs['validation/avg_episode_return'] = val_return
+                wandb_logs['validation/avg_episode_length'] = val_length
+
+            wandb.log(wandb_logs)
+            self.episode_return, self.episode_length = 0, 0
+            self.episode_idx += 1
+        
+        # Monitored metric to save model
+        self.log('val_episode_return', val_return, on_epoch=True)
+
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], nb_batch) -> OrderedDict:
         """
         Carries out a single step through the environment to update the replay buffer.
@@ -152,45 +175,20 @@ class DQNLightning(pl.LightningModule):
         Returns:
             Training loss and log metrics
         """
-        # Monitored metric to save model. A value need to be reported every iteration.
-        val_return = float('-inf') 
-
         device = self.get_device(batch)
         epsilon = max(self.eps_end, self.eps_start - self.global_step + 1 / self.eps_last_frame)
 
         # step through environment with agent
-        reward, done = self.agent.play_step(self.net, epsilon, device)
+        reward, self.episode_done = self.agent.play_step(self.net, epsilon, device)
         self.episode_return += reward
         self.episode_length += 1
 
-
         # calculates training loss
         loss = self.dqn_mse_loss(batch)
-
-        if done:
-            # Log every episode end
-            wandb = self.logger.experiment
-            wandb_logs = {"train/episode_return": self.episode_return,
-                        "train/episode_length": self.episode_length,
-                        "train/episode_number": self.episode_idx}
-            if self.episode_idx % 10 == 0:
-                val_accuracy, val_return, val_length = self.evaluate()
-                wandb_logs['validation/accuracy'] = val_accuracy
-                wandb_logs['validation/avg_episode_return'] = val_return
-                wandb_logs['validation/avg_episode_length'] = val_length
-
-            wandb.log(wandb_logs)
-            self.episode_return, self.episode_length = 0, 0
-            self.episode_idx += 1
-
-        # Soft update of target network
-        if self.global_step % self.sync_rate == 0:
-            self.target_net.load_state_dict(self.net.state_dict())
-        
         self.log('loss', loss, on_step=True)
 
-        # Monitored metric to save model
-        self.log('val_episode_return', val_return)
+        #Update target networks
+        self.soft_update(self.target_net, self.net, self.tau)
         return loss
 
     def configure_optimizers(self) -> List[Optimizer]:
@@ -211,6 +209,11 @@ class DQNLightning(pl.LightningModule):
     def get_device(self, batch) -> str:
         """Retrieve device currently being used by minibatch"""
         return batch[0].device.index if self.on_gpu else 'cpu'
+
+    @staticmethod
+    def soft_update(target, source, tau):
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
     @staticmethod
     def add_model_specific_args(parent_parser):  # pragma: no-cover
